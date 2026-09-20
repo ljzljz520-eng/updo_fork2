@@ -5,17 +5,18 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/Owloops/updo/aws"
 	"github.com/Owloops/updo/config"
+	"github.com/Owloops/updo/coordinator"
 	"github.com/Owloops/updo/metrics"
 	"github.com/Owloops/updo/net"
 	"github.com/Owloops/updo/notifications"
 	"github.com/Owloops/updo/stats"
 	ui "github.com/gizak/termui/v3"
 )
+
+const _shutdownGrace = 5 * time.Second
 
 type TargetData struct {
 	Target       config.Target
@@ -103,23 +104,45 @@ func StartMonitoring(targets []config.Target, options Options) {
 		webhookAlertStates[key.String()] = &webhookAlert
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	// Root context: cancelled by SIGINT/SIGTERM (or q/C-c below) and
+	// threaded through local HTTP, AWS config loading and Lambda Invoke.
+	ctx, cancel := coordinator.SignalContext(context.Background())
 	defer cancel()
 
+	runCoordinator := coordinator.New(coordinator.Config{
+		Targets:       targets,
+		Count:         options.Count,
+		Regions:       options.Regions,
+		Profile:       options.Profile,
+		ShutdownGrace: _shutdownGrace,
+	})
+	runCoordinator.Start(ctx)
+
 	dataChannel := make(chan TargetData, len(targets)*_dataChannelMultiplier)
-	var wg sync.WaitGroup
 
-	for i, target := range targets {
-		wg.Add(1)
-		go func(t config.Target, index int) {
-			defer wg.Done()
-			monitorTargetTUI(ctx, t, index, monitors, sequences, alertStates, webhookAlertStates, dataChannel, options)
-		}(target, i)
-	}
-
+	// Driver: reassembles committed rounds with the same RoundCommitter
+	// used by simple mode and forwards one TargetData per region outcome.
 	go func() {
-		wg.Wait()
-		close(dataChannel)
+		defer close(dataChannel)
+
+		committer := coordinator.NewRoundCommitter(func(targetIdx, roundID int, events []coordinator.Event) {
+			for _, event := range events {
+				data := buildTUIEventData(event, targets, monitors, sequences, alertStates, webhookAlertStates, options)
+
+				select {
+				case dataChannel <- data:
+				case <-ctx.Done():
+					return
+				}
+			}
+		})
+
+		for event := range runCoordinator.Events() {
+			if ctx.Err() != nil {
+				return
+			}
+			committer.Handle(event)
+		}
 	}()
 
 	manager := NewManager(targets, options)
@@ -210,8 +233,9 @@ func StartMonitoring(targets []config.Target, options Options) {
 			case "<Escape>":
 				if manager.listWidget != nil && manager.listWidget.IsSearchMode() {
 					manager.listWidget.ToggleSearch()
-					if manager.listWidget.OnSearchChange != nil {
-						manager.listWidget.OnSearchChange(manager.listWidget.GetQuery(), manager.listWidget.GetFilteredIndices())
+					if manager.listWidget.IsSearchMode() && manager.listWidget.OnSearchChange != nil {
+						indices := manager.listWidget.GetFilteredIndices()
+						manager.listWidget.OnSearchChange(manager.listWidget.GetQuery(), indices)
 					}
 					ui.Render(manager.grid)
 				}
@@ -261,193 +285,95 @@ func StartMonitoring(targets []config.Target, options Options) {
 	}
 }
 
-func monitorTargetTUI(ctx context.Context, target config.Target, targetIndex int, monitors map[string]*stats.Monitor, sequences map[string]*int, alertStates map[string]*bool, webhookAlertStates map[string]*bool, dataChannel chan<- TargetData, options Options) {
-	ticker := time.NewTicker(target.GetRefreshInterval())
-	defer ticker.Stop()
+func buildTUIEventData(
+	event coordinator.Event,
+	targets []config.Target,
+	monitors map[string]*stats.Monitor,
+	sequences map[string]*int,
+	alertStates map[string]*bool,
+	webhookAlertStates map[string]*bool,
+	options Options,
+) TargetData {
+	target := targets[event.TargetIndex]
+	targetKey := eventTargetKey(target, event)
 
-	attemptCount := 0
+	monitor, exists := monitors[targetKey.String()]
+	if !exists {
+		return TargetData{TargetKey: targetKey}
+	}
 
-	makeRequest := func() {
-		attemptCount++
-		netConfig := net.NetworkConfig{
-			Timeout:         target.GetTimeout(),
-			ShouldFail:      target.ShouldFail,
-			FollowRedirects: config.BoolVal(target.FollowRedirects, false),
-			AcceptRedirects: config.BoolVal(target.AcceptRedirects, false),
-			SkipSSL:         config.BoolVal(target.SkipSSL, false),
-			AssertText:      target.AssertText,
-			Headers:         target.Headers,
-			Method:          target.Method,
-			Body:            target.Body,
-			BodySizeLimit:   config.Int64Val(target.BodySizeLimit, net.DefaultBodySizeLimit),
-		}
+	// All terminal outcomes count; executor failures therefore stay in the
+	// availability denominator.
+	monitor.AddResult(event.Result)
 
-		regions := target.Regions
-		if len(regions) == 0 {
-			regions = options.Regions
-		}
+	sequence := sequences[targetKey.String()]
+	*sequence++
 
-		if len(regions) > 0 {
-			lambdaResults := aws.InvokeMultiRegion(target.URL, netConfig, regions, options.Profile)
-			for _, lambdaResult := range lambdaResults {
-				if lambdaResult.Error != nil {
-					errorResult := net.WebsiteCheckResult{
-						URL:           target.URL,
-						IsUp:          false,
-						StatusCode:    0,
-						LastCheckTime: time.Now(),
-					}
+	var alertErr error
+	var webhookErr error
 
-					indexedName := fmt.Sprintf("%s#%d", target.Name, targetIndex)
-					targetKey := stats.NewRegionTargetKey(indexedName, lambdaResult.Region, targetIndex)
-					dataChannel <- TargetData{
-						Target:      target,
-						Result:      errorResult,
-						Stats:       stats.Stats{},
-						TargetKey:   targetKey,
-						LambdaError: lambdaResult.Error,
-					}
-					continue
-				}
-
-				indexedName := fmt.Sprintf("%s#%d", target.Name, targetIndex)
-				targetKey := stats.NewRegionTargetKey(indexedName, lambdaResult.Region, targetIndex)
-				targetKeyStr := targetKey.String()
-
-				if monitor, exists := monitors[targetKeyStr]; exists {
-					monitor.AddResult(lambdaResult.Result)
-					if sequence, exists := sequences[targetKeyStr]; exists {
-						*sequence++
-					}
-
-					if config.BoolVal(target.ReceiveAlert, false) {
-						if alertSent, exists := alertStates[targetKeyStr]; exists {
-							if err := notifications.HandleAlerts(lambdaResult.Result.IsUp, alertSent, target.Name, lambdaResult.Result.URL); err != nil {
-								dataChannel <- TargetData{
-									Target:     target,
-									Result:     lambdaResult.Result,
-									Stats:      monitor.GetStats(),
-									TargetKey:  targetKey,
-									AlertError: err,
-								}
-							}
-						}
-					}
-
-					if target.WebhookURL != "" {
-						errorMsg := ""
-						if !lambdaResult.Result.IsUp {
-							switch {
-							case lambdaResult.Result.StatusCode > 0:
-								errorMsg = fmt.Sprintf("Non-success status code: %d", lambdaResult.Result.StatusCode)
-							case lambdaResult.Result.AssertText != "" && !lambdaResult.Result.AssertionPassed:
-								errorMsg = "Assertion failed"
-							default:
-								errorMsg = "Request failed"
-							}
-						}
-						if webhookAlertSent, exists := webhookAlertStates[targetKeyStr]; exists {
-							if err := notifications.HandleWebhookAlert(target.WebhookURL, target.WebhookHeaders, lambdaResult.Result.IsUp, webhookAlertSent, target.Name, lambdaResult.Result.URL, lambdaResult.Result.ResponseTime, lambdaResult.Result.StatusCode, errorMsg); err != nil {
-								dataChannel <- TargetData{
-									Target:       target,
-									Result:       lambdaResult.Result,
-									Stats:        stats.Stats{},
-									TargetKey:    targetKey,
-									WebhookError: err,
-								}
-							}
-						}
-					}
-
-					stats := monitor.GetStats()
-					dataChannel <- TargetData{
-						Target:    target,
-						Result:    lambdaResult.Result,
-						Stats:     stats,
-						TargetKey: targetKey,
-					}
+	if event.Outcome != coordinator.ExecutorFailure {
+		if config.BoolVal(target.ReceiveAlert, false) {
+			if alertSent, exists := alertStates[targetKey.String()]; exists {
+				if err := notifications.HandleAlerts(event.Result.IsUp, alertSent, target.Name, event.Result.URL); err != nil {
+					alertErr = err
 				}
 			}
-		} else {
-			result := net.CheckWebsite(target.URL, netConfig)
-			indexedName := fmt.Sprintf("%s#%d", target.Name, targetIndex)
-			targetKey := stats.NewLocalTargetKey(indexedName, targetIndex)
-			targetKeyStr := targetKey.String()
+		}
 
-			if monitor, exists := monitors[targetKeyStr]; exists {
-				monitor.AddResult(result)
-				if sequence, exists := sequences[targetKeyStr]; exists {
-					*sequence++
+		if target.WebhookURL != "" {
+			errorMsg := ""
+			if !event.Result.IsUp {
+				switch {
+				case event.Result.StatusCode > 0:
+					errorMsg = fmt.Sprintf("Non-success status code: %d", event.Result.StatusCode)
+				case event.Result.AssertText != "" && !event.Result.AssertionPassed:
+					errorMsg = "Assertion failed"
+				default:
+					errorMsg = "Request failed"
 				}
+			}
 
-				if config.BoolVal(target.ReceiveAlert, false) {
-					if alertSent, exists := alertStates[targetKeyStr]; exists {
-						if err := notifications.HandleAlerts(result.IsUp, alertSent, target.Name, target.URL); err != nil {
-							stats := monitor.GetStats()
-							dataChannel <- TargetData{
-								Target:     target,
-								Result:     result,
-								Stats:      stats,
-								TargetKey:  targetKey,
-								AlertError: err,
-							}
-						}
-					}
-				}
-
-				if target.WebhookURL != "" {
-					errorMsg := ""
-					if !result.IsUp {
-						errorMsg = fmt.Sprintf("Status code: %d", result.StatusCode)
-					}
-					if webhookAlertSent, exists := webhookAlertStates[targetKeyStr]; exists {
-						if err := notifications.HandleWebhookAlert(
-							target.WebhookURL,
-							target.WebhookHeaders,
-							result.IsUp,
-							webhookAlertSent,
-							target.Name,
-							target.URL,
-							result.ResponseTime,
-							result.StatusCode,
-							errorMsg,
-						); err != nil {
-							dataChannel <- TargetData{
-								Target:       target,
-								Result:       result,
-								Stats:        stats.Stats{},
-								TargetKey:    targetKey,
-								WebhookError: err,
-							}
-						}
-					}
-				}
-
-				stats := monitor.GetStats()
-				dataChannel <- TargetData{
-					Target:    target,
-					Result:    result,
-					Stats:     stats,
-					TargetKey: targetKey,
+			if webhookAlertSent, exists := webhookAlertStates[targetKey.String()]; exists {
+				if err := notifications.HandleWebhookAlert(
+					target.WebhookURL,
+					target.WebhookHeaders,
+					event.Result.IsUp,
+					webhookAlertSent,
+					target.Name,
+					event.Result.URL,
+					event.Result.ResponseTime,
+					event.Result.StatusCode,
+					errorMsg,
+				); err != nil {
+					webhookErr = err
 				}
 			}
 		}
 	}
 
-	makeRequest()
-	if options.Count > 0 && attemptCount >= options.Count {
-		return
+	data := TargetData{
+		Target:       target,
+		Result:       event.Result,
+		Stats:        monitor.GetStats(),
+		TargetKey:    targetKey,
+		AlertError:   alertErr,
+		WebhookError: webhookErr,
 	}
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			makeRequest()
-			if options.Count > 0 && attemptCount >= options.Count {
-				return
-			}
-		}
+	if event.Outcome == coordinator.ExecutorFailure {
+		data.LambdaError = event.Err
 	}
+
+	return data
+}
+
+func eventTargetKey(target config.Target, event coordinator.Event) stats.TargetKey {
+	indexedName := fmt.Sprintf("%s#%d", target.Name, event.TargetIndex)
+
+	if event.Region != "" {
+		return stats.NewRegionTargetKey(indexedName, event.Region, event.TargetIndex)
+	}
+
+	return stats.NewLocalTargetKey(indexedName, event.TargetIndex)
 }

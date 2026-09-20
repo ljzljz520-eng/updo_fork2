@@ -5,14 +5,11 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/signal"
 	"strings"
-	"sync"
-	"syscall"
 	"time"
 
-	"github.com/Owloops/updo/aws"
 	"github.com/Owloops/updo/config"
+	"github.com/Owloops/updo/coordinator"
 	"github.com/Owloops/updo/metrics"
 	"github.com/Owloops/updo/net"
 	"github.com/Owloops/updo/notifications"
@@ -21,8 +18,7 @@ import (
 )
 
 const (
-	_resultsChannelMultiplier = 2
-	_signalChannelBuffer      = 1
+	_shutdownGrace = 5 * time.Second
 )
 
 const (
@@ -88,8 +84,10 @@ func StartMultiTargetMonitoring(targets []config.Target, options MonitoringOptio
 		webhookAlertStates[keyStr] = &webhookAlert
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// Root context: cancelled by SIGINT/SIGTERM (or explicit cancel) and
+	// threaded through local HTTP, AWS config loading and Lambda Invoke.
+	ctx, stopSignals := coordinator.SignalContext(context.Background())
+	defer stopSignals()
 
 	prometheusURL := options.PrometheusURL
 	if prometheusURL == "" {
@@ -127,8 +125,14 @@ func StartMultiTargetMonitoring(targets []config.Target, options MonitoringOptio
 		defer metrics.StopRemoteWrite()
 	}
 
-	resultsChan := make(chan TargetResult, len(targets)*_resultsChannelMultiplier)
-	var wg sync.WaitGroup
+	runCoordinator := coordinator.New(coordinator.Config{
+		Targets:       targets,
+		Count:         options.Count,
+		Regions:       options.Regions,
+		Profile:       options.Profile,
+		ShutdownGrace: _shutdownGrace,
+	})
+	runCoordinator.Start(ctx)
 
 	logMode := options.Log != ""
 
@@ -137,204 +141,123 @@ func StartMultiTargetMonitoring(targets []config.Target, options MonitoringOptio
 		outputManager.PrintHeader()
 	}
 
-	for i, target := range targets {
-		wg.Add(1)
-		go func(t config.Target, index int) {
-			defer wg.Done()
-			monitorTargetSimple(ctx, t, index, monitors, sequences, alertStates, webhookAlertStates, resultsChan, options)
-		}(target, i)
+	// Side effects for one committed region outcome.
+	committer := coordinator.NewRoundCommitter(func(targetIdx, roundID int, events []coordinator.Event) {
+		for _, event := range events {
+			processCommittedEvent(event, targets, monitors, sequences, alertStates, webhookAlertStates, options, outputManager, logMode)
+		}
+	})
+
+	// Range ends only after the coordinator closes the stream: normal
+	// completion (all per-target rounds committed) or the bounded shutdown
+	// after a signal, with committed events drained.
+	for event := range runCoordinator.Events() {
+		committer.Handle(event)
 	}
 
-	go func() {
-		wg.Wait()
-		close(resultsChan)
-	}()
+	outputManager.PrintFinalStatisticsWithKeys(monitors, keyRegistry, logMode)
+}
 
-	sigChan := make(chan os.Signal, _signalChannelBuffer)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+func processCommittedEvent(
+	event coordinator.Event,
+	targets []config.Target,
+	monitors map[string]*stats.Monitor,
+	sequences map[string]*int,
+	alertStates map[string]*bool,
+	webhookAlertStates map[string]*bool,
+	options MonitoringOptions,
+	outputManager *OutputManager,
+	logMode bool,
+) {
+	target := targets[event.TargetIndex]
+	targetKey := eventTargetKey(target, event)
 
-	totalChecks := 0
-	for {
-		select {
-		case result, ok := <-resultsChan:
-			if !ok {
-				return
-			}
+	monitor, exists := monitors[targetKey.String()]
+	if !exists {
+		return
+	}
 
-			totalChecks++
-			if !logMode {
-				outputManager.PrintResult(result)
-			} else {
-				utils.LogCheck(result.Result, result.Sequence, options.Log, result.Region)
-				if !result.Result.IsUp {
-					errorMsg := getErrorMessage(result.Result)
-					utils.LogWarning(result.Target.URL, errorMsg, result.Region)
+	if event.Result.ResponseTruncated {
+		log.Printf("Warning: response body from %s truncated at BodySizeLimit of %d bytes",
+			target.URL, config.Int64Val(target.BodySizeLimit, net.DefaultBodySizeLimit))
+	}
+
+	// Every terminal outcome (success, probe failure and executor failure)
+	// is fed to stats, so executor failures stay in the availability
+	// denominator.
+	monitor.AddResult(event.Result)
+
+	sequence := sequences[targetKey.String()]
+	*sequence++
+	seq := *sequence
+
+	if event.Outcome == coordinator.ExecutorFailure {
+		utils.LogWarning(target.URL, fmt.Sprintf("Lambda invocation failed: %v", event.Err), event.Region)
+	}
+
+	if event.Outcome != coordinator.ExecutorFailure {
+		if config.BoolVal(target.ReceiveAlert, false) {
+			if alertSent, exists := alertStates[targetKey.String()]; exists {
+				if err := notifications.HandleAlerts(event.Result.IsUp, alertSent, target.Name, event.Result.URL); err != nil {
+					log.Printf("Alert notification failed: %v", err)
 				}
 			}
+		}
 
-			if options.PrometheusURL != "" {
-				metrics.RecordCheck(result.Target, result.Result, result.Region)
-
-				if strings.HasPrefix(result.Target.URL, "https://") {
-					if sslExpiry := net.GetSSLCertExpiry(result.Target.URL); sslExpiry >= 0 {
-						metrics.RecordSSLExpiry(result.Target, sslExpiry)
-					}
+		if target.WebhookURL != "" {
+			errorMsg := getErrorMessage(event.Result)
+			if webhookAlertSent, exists := webhookAlertStates[targetKey.String()]; exists {
+				if err := notifications.HandleWebhookAlert(
+					target.WebhookURL,
+					target.WebhookHeaders,
+					event.Result.IsUp,
+					webhookAlertSent,
+					target.Name,
+					event.Result.URL,
+					event.Result.ResponseTime,
+					event.Result.StatusCode,
+					errorMsg,
+				); err != nil {
+					log.Printf("[ERROR] %v", err)
 				}
 			}
+		}
+	}
 
-			if options.Count > 0 && totalChecks >= options.Count*len(targets) {
-				outputManager.PrintFinalStatisticsWithKeys(monitors, keyRegistry, logMode)
-				cancel()
-				return
+	targetResult := TargetResult{
+		Target:   target,
+		Result:   event.Result,
+		Stats:    monitor.GetStats(),
+		Sequence: seq,
+		Region:   event.Region,
+	}
+
+	if !logMode {
+		outputManager.PrintResult(targetResult)
+	} else {
+		utils.LogCheck(event.Result, seq, options.Log, event.Region)
+		if !event.Result.IsUp {
+			utils.LogWarning(target.URL, getErrorMessage(event.Result), event.Region)
+		}
+	}
+
+	if options.PrometheusURL != "" {
+		metrics.RecordCheck(target, event.Result, event.Region)
+
+		if strings.HasPrefix(target.URL, "https://") {
+			if sslExpiry := net.GetSSLCertExpiry(target.URL); sslExpiry >= 0 {
+				metrics.RecordSSLExpiry(target, sslExpiry)
 			}
-
-		case <-sigChan:
-			outputManager.PrintFinalStatisticsWithKeys(monitors, keyRegistry, logMode)
-			cancel()
-			return
 		}
 	}
 }
 
-func monitorTargetSimple(ctx context.Context, target config.Target, targetIndex int, monitors map[string]*stats.Monitor, sequences map[string]*int, alertStates map[string]*bool, webhookAlertStates map[string]*bool, resultsChan chan<- TargetResult, options MonitoringOptions) {
-	ticker := time.NewTicker(target.GetRefreshInterval())
-	defer ticker.Stop()
+func eventTargetKey(target config.Target, event coordinator.Event) stats.TargetKey {
+	indexedName := fmt.Sprintf("%s#%d", target.Name, event.TargetIndex)
 
-	attemptCount := 0
-
-	makeRequest := func() {
-		attemptCount++
-		netConfig := net.NetworkConfig{
-			Timeout:         target.GetTimeout(),
-			ShouldFail:      target.ShouldFail,
-			FollowRedirects: config.BoolVal(target.FollowRedirects, false),
-			AcceptRedirects: config.BoolVal(target.AcceptRedirects, false),
-			SkipSSL:         config.BoolVal(target.SkipSSL, false),
-			AssertText:      target.AssertText,
-			Headers:         target.Headers,
-			Method:          target.Method,
-			Body:            target.Body,
-			BodySizeLimit:   config.Int64Val(target.BodySizeLimit, net.DefaultBodySizeLimit),
-		}
-
-		regions := target.Regions
-		if len(regions) == 0 {
-			regions = options.Regions
-		}
-
-		if len(regions) > 0 {
-			lambdaResults := aws.InvokeMultiRegion(target.URL, netConfig, regions, options.Profile)
-			for _, lambdaResult := range lambdaResults {
-				indexedName := fmt.Sprintf("%s#%d", target.Name, targetIndex)
-				targetKey := stats.NewRegionTargetKey(indexedName, lambdaResult.Region, targetIndex)
-				keyStr := targetKey.String()
-
-				if monitor, exists := monitors[keyStr]; exists {
-					if lambdaResult.Error != nil {
-						utils.LogWarning(target.URL, fmt.Sprintf("Lambda invocation failed: %v", lambdaResult.Error), lambdaResult.Region)
-						continue
-					}
-
-					monitor.AddResult(lambdaResult.Result)
-					if sequence, exists := sequences[keyStr]; exists {
-						*sequence++
-					}
-
-					if config.BoolVal(target.ReceiveAlert, false) {
-						if alertSent, exists := alertStates[keyStr]; exists {
-							if err := notifications.HandleAlerts(lambdaResult.Result.IsUp, alertSent, target.Name, lambdaResult.Result.URL); err != nil {
-								log.Printf("Alert notification failed: %v", err)
-							}
-						}
-					}
-
-					if target.WebhookURL != "" {
-						errorMsg := getErrorMessage(lambdaResult.Result)
-						if webhookAlertSent, exists := webhookAlertStates[keyStr]; exists {
-							if err := notifications.HandleWebhookAlert(target.WebhookURL, target.WebhookHeaders, lambdaResult.Result.IsUp, webhookAlertSent, target.Name, lambdaResult.Result.URL, lambdaResult.Result.ResponseTime, lambdaResult.Result.StatusCode, errorMsg); err != nil {
-								log.Printf("[ERROR] %v", err)
-							}
-						}
-					}
-
-					seq := 0
-					if sequence, exists := sequences[keyStr]; exists {
-						seq = *sequence
-					}
-
-					resultsChan <- TargetResult{
-						Target:   target,
-						Result:   lambdaResult.Result,
-						Stats:    monitor.GetStats(),
-						Sequence: seq,
-						Region:   lambdaResult.Region,
-					}
-				}
-			}
-		} else {
-			indexedName := fmt.Sprintf("%s#%d", target.Name, targetIndex)
-			targetKey := stats.NewLocalTargetKey(indexedName, targetIndex)
-			keyStr := targetKey.String()
-
-			if monitor, exists := monitors[keyStr]; exists {
-				result := net.CheckWebsite(target.URL, netConfig)
-				if result.ResponseTruncated {
-					log.Printf("Warning: response body from %s truncated at BodySizeLimit of %d bytes", target.URL, netConfig.BodySizeLimit)
-				}
-				monitor.AddResult(result)
-				if sequence, exists := sequences[keyStr]; exists {
-					*sequence++
-				}
-
-				if config.BoolVal(target.ReceiveAlert, false) {
-					if alertSent, exists := alertStates[keyStr]; exists {
-						if err := notifications.HandleAlerts(result.IsUp, alertSent, target.Name, target.URL); err != nil {
-							log.Printf("Alert notification failed: %v", err)
-						}
-					}
-				}
-
-				if target.WebhookURL != "" {
-					errorMsg := getErrorMessage(result)
-					if webhookAlertSent, exists := webhookAlertStates[keyStr]; exists {
-						if err := notifications.HandleWebhookAlert(target.WebhookURL, target.WebhookHeaders, result.IsUp, webhookAlertSent, target.Name, target.URL, result.ResponseTime, result.StatusCode, errorMsg); err != nil {
-							log.Printf("[ERROR] %v", err)
-						}
-					}
-				}
-
-				seq := 0
-				if sequence, exists := sequences[keyStr]; exists {
-					seq = *sequence
-				}
-
-				resultsChan <- TargetResult{
-					Target:   target,
-					Result:   result,
-					Stats:    monitor.GetStats(),
-					Sequence: seq,
-					Region:   "",
-				}
-			}
-		}
+	if event.Region != "" {
+		return stats.NewRegionTargetKey(indexedName, event.Region, event.TargetIndex)
 	}
 
-	makeRequest()
-
-	if options.Count > 0 && attemptCount >= options.Count {
-		return
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			makeRequest()
-
-			if options.Count > 0 && attemptCount >= options.Count {
-				return
-			}
-		}
-	}
+	return stats.NewLocalTargetKey(indexedName, event.TargetIndex)
 }

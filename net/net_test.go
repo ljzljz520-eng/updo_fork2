@@ -1,6 +1,7 @@
 package net
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -336,7 +337,7 @@ func TestCheckWebsite(t *testing.T) {
 			}))
 			defer server.Close()
 
-			result := CheckWebsite(server.URL, tt.config)
+			result := CheckWebsite(context.Background(), server.URL, tt.config)
 
 			if result.IsUp != tt.expectSuccess {
 				t.Errorf("CheckWebsite() IsUp = %v, want %v", result.IsUp, tt.expectSuccess)
@@ -370,7 +371,7 @@ func TestCheckWebsiteWithHeaders(t *testing.T) {
 		Headers: []string{"Authorization: Bearer test-token", "Content-Type: application/json"},
 	}
 
-	result := CheckWebsite(server.URL, config)
+	result := CheckWebsite(context.Background(), server.URL, config)
 
 	if !result.IsUp {
 		t.Error("CheckWebsite() with headers should succeed")
@@ -398,7 +399,7 @@ func TestCheckWebsiteWithHostHeader(t *testing.T) {
 		Headers: []string{"Host: " + wantHost},
 	}
 
-	result := CheckWebsite(server.URL, config)
+	result := CheckWebsite(context.Background(), server.URL, config)
 
 	if !result.IsUp {
 		t.Errorf("CheckWebsite() with Host header should succeed, got status %d", result.StatusCode)
@@ -469,7 +470,7 @@ func TestCheckWebsiteBodyLimit(t *testing.T) {
 			defer server.Close()
 
 			config := NetworkConfig{Timeout: 5 * time.Second, BodySizeLimit: tt.bodySizeLimit}
-			result := CheckWebsite(server.URL, config)
+			result := CheckWebsite(context.Background(), server.URL, config)
 
 			if result.ResponseTruncated != tt.wantTruncated {
 				t.Errorf("ResponseTruncated = %v, want %v", result.ResponseTruncated, tt.wantTruncated)
@@ -478,5 +479,30 @@ func TestCheckWebsiteBodyLimit(t *testing.T) {
 				t.Errorf("ResponseBody length = %d, want %d", len(result.ResponseBody), tt.wantBodyLength)
 			}
 		})
+	}
+}
+
+func TestCheckWebsiteContextCancel(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(2 * time.Second)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	result := CheckWebsite(ctx, server.URL, NetworkConfig{Timeout: 5 * time.Second})
+	elapsed := time.Since(start)
+
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("CheckWebsite did not return promptly after ctx cancel: %v", elapsed)
+	}
+	if result.IsUp {
+		t.Error("CheckWebsite IsUp = true, want false after ctx cancel")
 	}
 }

@@ -114,7 +114,7 @@ func handleRequest(ctx context.Context, req CheckRequest) (CheckResponse, error)
 		BodySizeLimit:   req.BodySizeLimit,
 	}
 
-	result := net.CheckWebsite(req.URL, netConfig)
+	result := net.CheckWebsite(ctx, req.URL, netConfig)
 
 	resp.StatusCode = result.StatusCode
 	resp.ResponseTimeMs = float64(result.ResponseTime / time.Millisecond)

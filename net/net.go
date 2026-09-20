@@ -2,6 +2,7 @@ package net
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"errors"
 	"flag"
@@ -95,7 +96,7 @@ type HTTPResponse struct {
 	Error             error
 }
 
-func CheckWebsite(urlStr string, config NetworkConfig) WebsiteCheckResult {
+func CheckWebsite(ctx context.Context, urlStr string, config NetworkConfig) WebsiteCheckResult {
 	method := "GET"
 	if config.Method != "" {
 		method = config.Method
@@ -113,7 +114,7 @@ func CheckWebsite(urlStr string, config NetworkConfig) WebsiteCheckResult {
 		}
 	}
 
-	httpResp := makeHTTPRequest(urlStr, options, config)
+	httpResp := makeHTTPRequest(ctx, urlStr, options, config)
 
 	result := WebsiteCheckResult{
 		URL:               urlStr,
@@ -270,7 +271,7 @@ func AutoDetectProtocol(inputURL string) string {
 	return formattedURL
 }
 
-func makeHTTPRequest(urlStr string, options HTTPRequestOptions, config NetworkConfig) *HTTPResponse {
+func makeHTTPRequest(ctx context.Context, urlStr string, options HTTPRequestOptions, config NetworkConfig) *HTTPResponse {
 	result := &HTTPResponse{
 		URL:            urlStr,
 		Method:         options.Method,
@@ -313,7 +314,7 @@ func makeHTTPRequest(urlStr string, options HTTPRequestOptions, config NetworkCo
 		reqBody = bytes.NewBufferString(options.Body)
 	}
 
-	req, err := http.NewRequest(options.Method, urlStr, reqBody)
+	req, err := http.NewRequestWithContext(ctx, options.Method, urlStr, reqBody)
 	if err != nil {
 		result.Error = err
 		return result

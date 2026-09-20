@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -59,36 +58,8 @@ type RegionResult struct {
 	Error  error
 }
 
-func InvokeMultiRegion(url string, config net.NetworkConfig, regions []string, profile string) []RegionResult {
-	if len(regions) == 0 {
-		return nil
-	}
-
-	var wg sync.WaitGroup
-	resultsChan := make(chan RegionResult, len(regions))
-
-	for _, region := range regions {
-		wg.Add(1)
-		go func(r string) {
-			defer wg.Done()
-			result := invokeLambdaInRegion(url, config, r, profile)
-			resultsChan <- result
-		}(region)
-	}
-
-	wg.Wait()
-	close(resultsChan)
-
-	results := make([]RegionResult, 0, len(regions))
-	for result := range resultsChan {
-		results = append(results, result)
-	}
-
-	return results
-}
-
-func invokeLambdaInRegion(url string, config net.NetworkConfig, region string, profile string) RegionResult {
-	ctx, cancel := context.WithTimeout(context.Background(), _awsOperationTimeout)
+func InvokeInRegion(ctx context.Context, url string, config net.NetworkConfig, region string, profile string) RegionResult {
+	ctx, cancel := context.WithTimeout(ctx, _awsOperationTimeout)
 	defer cancel()
 
 	cfg, err := loadAWSConfig(ctx, region, profile)
